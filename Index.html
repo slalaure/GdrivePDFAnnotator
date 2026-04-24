@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <link href="https://cdn.jsdelivr.net/npm/@mdi/font@6.x/css/materialdesignicons.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/vuetify@3.5.8/dist/vuetify.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vuetify@3.5.8/dist/vuetify.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+  
+  <style>
+    .editor-container { position: relative; overflow: auto; background: #525659; padding: 20px; height: calc(100vh - 64px); }
+    .canvas-wrapper { position: relative; margin: 0 auto; box-shadow: 0 0 10px rgba(0,0,0,0.5); background: white; transition: width 0.2s, height 0.2s; }
+    #pdf-canvas { position: absolute; top: 0; left: 0; width: 100% !important; height: 100% !important; }
+    .fabric-canvas-container { position: absolute; top: 0; left: 0; z-index: 10; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <v-app>
+      <v-snackbar v-model="toast.show" :timeout="10000" color="success" elevation="24">
+        {{ toast.message }}
+        <template v-slot:actions>
+          <v-btn v-if="toast.url" color="white" variant="outlined" class="mr-3" @click="openLink(toast.url)" prepend-icon="mdi-open-in-new">
+            {{ t('openLink') }}
+          </v-btn>
+          <v-btn color="white" variant="text" icon="mdi-close" @click="toast.show = false"></v-btn>
+        </template>
+      </v-snackbar>
+
+      <v-navigation-drawer permanent width="350">
+        <v-list :title="t('explorer')">
+          <tree-item v-for="item in rootNodes" :key="item.id" :item="item" @select-folder="loadFiles" @open-pdf="openPdf"></tree-item>
+        </v-list>
+      </v-navigation-drawer>
+
+      <v-main>
+        <v-container fluid>
+          <v-row v-if="selectedFolderName" class="align-center mb-2 mx-1">
+            <v-col class="d-flex align-center">
+              <h3 class="mb-0">{{ selectedFolderName }}</h3>
+              <v-btn icon="mdi-refresh" variant="text" size="small" class="ml-3" @click="refreshFolder" :title="t('refresh')"></v-btn>
+              <v-btn icon="mdi-folder-open-outline" variant="text" size="small" class="ml-1" @click="openDriveFolder" :title="t('openInDrive')"></v-btn>
+            </v-col>
+          </v-row>
+          
+          <v-infinite-scroll v-if="currentFolder" :key="currentFolder.id" @load="loadMore" class="overflow-hidden">
+            <v-row class="ma-0">
+              <v-col v-for="pdf in pdfList" :key="pdf.id" cols="12" sm="6" md="4" lg="3" xl="2">
+                <v-card @click="openPdf(pdf)" variant="outlined" class="pa-3 text-center d-flex flex-column align-center" hover height="100%">
+                  <v-icon color="red" size="48">mdi-file-pdf-box</v-icon>
+                  <div class="text-truncate font-weight-bold w-100 mt-2" :title="pdf.name">{{ pdf.name }}</div>
+                  <v-spacer></v-spacer>
+                  <div class="text-caption text-grey mt-3 w-100">
+                    <v-icon size="small" class="mr-1">mdi-clock-outline</v-icon>{{ formatDate(pdf.lastUpdated) }}
+                  </div>
+                  <div class="text-caption text-grey mt-1 text-truncate w-100" :title="pdf.owner">
+                    <v-icon size="small" class="mr-1">mdi-account-outline</v-icon>{{ pdf.owner }}
+                  </div>
+                </v-card>
+              </v-col>
+            </v-row>
+            <template v-slot:empty>
+               <div class="text-center text-grey my-4">
+                  <span v-if="pdfList.length === 0">{{ t('noFiles') }}</span>
+                  <span v-else>{{ t('noMoreFiles') }}</span>
+               </div>
+            </template>
+          </v-infinite-scroll>
+        </v-container>
+      </v-main>
+
+      <v-overlay v-model="loading" class="align-center justify-center" persistent>
+        <v-progress-circular indeterminate size="64" color="primary"></v-progress-circular>
+        <div class="mt-2 text-white">{{ t('loading') }}</div>
+      </v-overlay>
+
+      <v-dialog v-model="overwriteDialog" max-width="450" persistent>
+        <v-card>
+          <v-card-title class="text-h6 text-warning"><v-icon class="mr-2">mdi-alert</v-icon>{{ t('fileExistent') }}</v-card-title>
+          <v-card-text class="pt-2">{{ t('overwritePrompt') }}</v-card-text>
+          <v-card-actions>
+            <v-spacer></v-spacer>
+            <v-btn variant="text" @click="cancelExport">{{ t('cancel') }}</v-btn>
+            <v-btn color="error" variant="elevated" @click="confirmOverwrite" :loading="exporting">{{ t('yes') }}</v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
+
+      <v-dialog v-model="editorOpen" fullscreen transition="fade-transition" :retain-focus="false">
+        <v-card v-if="currentPdf">
+          <v-toolbar color="surface-variant" density="compact">
+            <v-btn icon @click="closeEditor"><v-icon>mdi-arrow-left</v-icon></v-btn>
+            <v-toolbar-title class="text-body-2">{{ currentPdf.name }}</v-toolbar-title>
+            
+            <v-divider vertical class="mx-3"></v-divider>
+            
+            <v-btn icon @click="changeZoom(-0.25)" :disabled="currentScale <= 0.5" :title="t('zoomOut')"><v-icon>mdi-magnify-minus-outline</v-icon></v-btn>
+            <span class="mx-2 text-button">{{ Math.round(currentScale * 100) }}%</span>
+            <v-btn icon @click="changeZoom(0.25)" :disabled="currentScale >= 4.0" :title="t('zoomIn')"><v-icon>mdi-magnify-plus-outline</v-icon></v-btn>
+            
+            <v-divider vertical class="mx-3"></v-divider>
+
+            <input type="color" v-model="selectedColor" @change="updateToolOptions" class="mr-2" style="width: 30px; height: 30px; border: none; background: transparent; cursor: pointer;">
+            <v-btn-toggle v-model="tool" mandatory color="primary" class="mr-4" density="compact">
+              <v-btn value="pen" @click="setTool('pen')" :title="t('pen')"><v-icon>mdi-pencil</v-icon></v-btn>
+              <v-btn value="highlighter" @click="setTool('highlighter')" :title="t('highlighter')"><v-icon>mdi-marker</v-icon></v-btn>
+              <v-btn value="text" @click="setTool('text')" :title="t('text')"><v-icon>mdi-format-text</v-icon></v-btn>
+              <v-btn value="eraser" @click="setTool('eraser')" :title="t('eraser')"><v-icon>mdi-eraser</v-icon></v-btn>
+            </v-btn-toggle>
+            <v-checkbox v-model="showTag" :label="t('tag')" hide-details density="compact" class="mr-4"></v-checkbox>
+            
+            <v-spacer></v-spacer>
+            <v-btn icon @click="undo" :title="t('undo')" class="mr-2"><v-icon>mdi-undo</v-icon></v-btn>
+            <v-btn color="info" variant="tonal" class="mr-2" @click="historyDialog = true" prepend-icon="mdi-history">{{ t('history') }}</v-btn>
+            <v-btn color="success" @click="saveAnnotations" :loading="saving" prepend-icon="mdi-content-save" class="mr-2">{{ t('save') }}</v-btn>
+            <v-btn color="deep-purple-accent-2" variant="flat" @click="exportPdf" :loading="exporting" prepend-icon="mdi-printer">{{ t('export') }}</v-btn>
+          </v-toolbar>
+
+          <div class="editor-container">
+             <div id="wrapper" class="canvas-wrapper" :style="{ width: cw + 'px', height: ch + 'px' }">
+                <canvas id="pdf-canvas"></canvas>
+                <canvas id="drawing-canvas"></canvas>
+             </div>
+          </div>
+        </v-card>
+      </v-dialog>
+
+      <v-dialog v-model="historyDialog" max-width="600">
+        <v-card>
+          <v-card-title>{{ t('historyTitle') }}</v-card-title>
+          <v-card-text>
+            <v-list>
+              <v-list-item v-for="(hist, index) in historyList" :key="index" :class="{'bg-grey-lighten-3': index === currentIndex}">
+                <template v-slot:prepend><v-avatar color="primary" class="text-white">{{ hist.initials }}</v-avatar></template>
+                <v-list-item-title>{{ t('modifiedBy') }} {{ hist.author }}</v-list-item-title>
+                <v-list-item-subtitle>{{ new Date(hist.date).toLocaleString() }}</v-list-item-subtitle>
+                <template v-slot:append>
+                  <v-btn v-if="index !== currentIndex" size="small" color="warning" @click="restoreVersion(index)">{{ t('restore') }}</v-btn>
+                  <v-chip v-else color="success" size="small">{{ t('current') }}</v-chip>
+                </template>
+              </v-list-item>
+            </v-list>
+            <div v-if="historyList.length === 0" class="text-center text-grey">{{ t('noHistory') }}</div>
+          </v-card-text>
+          <v-card-actions><v-spacer></v-spacer><v-btn @click="historyDialog = false">{{ t('close') }}</v-btn></v-card-actions>
+        </v-card>
+      </v-dialog>
+    </v-app>
+  </div>
+
+  <script>
+    /**
+     * Project: GDrive PDF Annotator
+     * Author: Sebastien Lalaurette
+     * Year: 2026
+     */
+
+    const i18nDict = {
+      en: { 
+        myDrive: "My Drive", shared: "Shared with me", starred: "Starred", explorer: "Drive Explorer", 
+        loading: "Loading...", save: "Save", export: "Export PDF", exporting: "Exporting PDF...", 
+        exportSuccess: "PDF exported successfully!", history: "History", pen: "Pen", highlighter: "Highlighter", 
+        text: "Text", eraser: "Eraser", tag: "Author tag", close: "Close", zoomIn: "Zoom In", zoomOut: "Zoom Out", 
+        savedSuccess: "Saved successfully.", restored: "Version restored. Remember to save.", current: "Current", 
+        modifiedBy: "Modified by", noHistory: "No history available.", historyTitle: "Modification History", 
+        undo: "Undo", overwritePrompt: "This file already exists. Do you want to overwrite it?", yes: "Yes", 
+        cancel: "Cancel", openLink: "Open file", refresh: "Refresh", openInDrive: "Open in Google Drive", 
+        lastMod: "Modified on", author: "Author", fileExistent: "File exists", noFiles: "No PDFs found in this folder.", 
+        noMoreFiles: "No more files." 
+      },
+      fr: { 
+        myDrive: "Mon Drive", shared: "Partagés avec moi", starred: "Favoris", explorer: "Explorateur Drive", 
+        loading: "Chargement...", save: "Enregistrer", export: "Exporter PDF", exporting: "Exportation du PDF en cours...", 
+        exportSuccess: "PDF exporté avec succès !", history: "Historique", pen: "Stylo", highlighter: "Surligneur", 
+        text: "Texte", eraser: "Gomme", tag: "Tag auteur", close: "Fermer", zoomIn: "Zoom avant", zoomOut: "Zoom arrière", 
+        savedSuccess: "Modifications enregistrées avec succès.", restored: "Version restaurée. Pensez à enregistrer.", 
+        current: "Actuel", modifiedBy: "Modifié par", noHistory: "Aucun historique disponible.", 
+        historyTitle: "Historique des versions", undo: "Annuler", overwritePrompt: "Ce fichier existe déjà. Voulez-vous l'écraser ?", 
+        yes: "Oui", cancel: "Annuler", openLink: "Ouvrir le fichier", refresh: "Rafraîchir", openInDrive: "Ouvrir dans Google Drive", 
+        lastMod: "Modifié le", author: "Auteur", fileExistent: "Fichier existant", noFiles: "Aucun PDF trouvé dans ce dossier.", 
+        noMoreFiles: "Plus de fichiers." 
+      }
+    };
+    const userLang = navigator.language.startsWith('fr') ? 'fr' : 'en';
+    const t = (key) => i18nDict[userLang][key] || key;
+
+    // Component: TreeItem for folder navigation
+    const TreeItem = {
+      name: 'tree-item',
+      props: ['item'],
+      template: 
+        '<div>' +
+          '<v-list-item :prepend-icon="item.type === \'folder\' ? (isOpen ? \'mdi-folder-open\' : \'mdi-folder\') : \'mdi-file-pdf-box\'" @click="handleClick">' +
+            '<template v-slot:append v-if="item.type === \'folder\'"><v-btn icon="mdi-chevron-down" variant="text" size="small" :rotate="isOpen ? 180 : 0"></v-btn></template>' +
+            '<v-list-item-title>{{ item.name }}</v-list-item-title>' +
+          '</v-list-item>' +
+          '<div v-if="isOpen && item.type === \'folder\'" class="ml-4">' +
+             '<tree-item v-for="child in children" :key="child.id" :item="child" @select-folder="$emit(\'select-folder\', $event)" @open-pdf="$emit(\'open-pdf\', $event)"></tree-item>' +
+          '</div>' +
+        '</div>',
+      data() { return { isOpen: false, children: [] }; },
+      methods: {
+        handleClick() {
+          if (this.item.type === 'folder') {
+            this.isOpen = !this.isOpen;
+            this.$emit('select-folder', this.item);
+            if (this.isOpen && this.children.length === 0) {
+              google.script.run.withSuccessHandler(data => this.children = data).getSubFolders(this.item.id);
+            }
+          } else this.$emit('open-pdf', this.item);
+        }
+      }
+    };
+
+    const { createApp, ref, onMounted, nextTick } = Vue;
+    const vuetify = Vuetify.createVuetify();
+
+    createApp({
+      components: { TreeItem },
+      setup() {
+        const rootNodes = ref([]);
+        const pdfList = ref([]);
+        const currentFolder = ref(null);
+        
+        const currentContinuationToken = ref(null);
+        const hasMoreFiles = ref(true);
+        
+        const selectedFolderName = ref('');
+        const loading = ref(false);
+        const editorOpen = ref(false);
+        const currentPdf = ref(null);
+        
+        const currentScale = ref(1.5);
+        let pdfPageObj = null;
+
+        const tool = ref('pen');
+        const selectedColor = ref('#ff0000');
+        const showTag = ref(true);
+        const userDetails = ref({ email: '', initials: 'INC' });
+        const toast = ref({ show: false, message: '', url: null });
+        
+        const historyList = ref([]);
+        const currentIndex = ref(-1);
+        const historyDialog = ref(false);
+        const saving = ref(false);
+        
+        const exporting = ref(false);
+        const overwriteDialog = ref(false);
+        const pendingExportData = ref(null);
+
+        const cw = ref(800); const ch = ref(1100);
+
+        let fCanvas = null;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        onMounted(() => {
+          google.script.run.withSuccessHandler(data => {
+            rootNodes.value = data.map(n => ({...n, name: t(n.nameKey) || n.name}));
+          }).getRoots();
+          google.script.run.withSuccessHandler(data => userDetails.value = data).getUserDetails();
+        });
+
+        // Initialize folder loading
+        const loadFiles = (folder) => {
+          currentFolder.value = folder;
+          selectedFolderName.value = folder.name;
+          pdfList.value = [];
+          currentContinuationToken.value = null;
+          hasMoreFiles.value = true;
+        };
+
+        const refreshFolder = () => {
+          if (currentFolder.value) loadFiles(currentFolder.value);
+        };
+
+        const openDriveFolder = () => {
+          if (!currentFolder.value) return;
+          const id = currentFolder.value.id;
+          let url = '';
+          if (id === 'root') url = 'https://drive.google.com/drive/my-drive';
+          else if (id === 'shared') url = 'https://drive.google.com/drive/shared-with-me';
+          else if (id === 'starred') url = 'https://drive.google.com/drive/starred';
+          else url = 'https://drive.google.com/drive/folders/' + id;
+          window.open(url, '_blank');
+        };
+
+        // Handle infinite scroll loading
+        const loadMore = ({ done }) => {
+          if (!currentFolder.value || !hasMoreFiles.value) {
+            done('empty');
+            return;
+          }
+          google.script.run.withSuccessHandler(data => {
+            pdfList.value.push(...data.files);
+            currentContinuationToken.value = data.nextToken;
+            hasMoreFiles.value = !!data.nextToken;
+            
+            if (data.nextToken) {
+              done('ok');
+            } else {
+              done('empty');
+            }
+          }).getPdfsInFolderPaginated(currentFolder.value.id, currentContinuationToken.value);
+        };
+
+        const openPdf = (pdf) => {
+          currentPdf.value = pdf;
+          loading.value = true;
+          currentScale.value = 1.5;
+          
+          google.script.run.withSuccessHandler(async (base64) => {
+            const pdfDoc = await pdfjsLib.getDocument({ data: atob(base64) }).promise;
+            pdfPageObj = await pdfDoc.getPage(1);
+            editorOpen.value = true;
+            nextTick(() => renderCurrentZoom(pdf.id, true));
+          }).getPdfBase64(pdf.id);
+        };
+
+        const closeEditor = () => {
+          editorOpen.value = false;
+          pdfPageObj = null;
+          if(fCanvas) { fCanvas.dispose(); fCanvas = null; }
+          refreshFolder();
+        };
+
+        const formatDate = (isoString) => {
+          if(!isoString) return '';
+          const options = { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' };
+          return new Date(isoString).toLocaleDateString(userLang === 'fr' ? 'fr-FR' : 'en-US', options);
+        };
+
+        const openLink = (url) => {
+          window.open(url, '_blank');
+          toast.value.show = false;
+        };
+
+        const changeZoom = (delta) => {
+          loading.value = true;
+          currentScale.value = Math.max(0.5, Math.min(4.0, currentScale.value + delta));
+          setTimeout(() => renderCurrentZoom(currentPdf.value.id, false), 50);
+        };
+
+        const renderCurrentZoom = (pdfId, isInitialLoad) => {
+          if (!pdfPageObj) return;
+          const viewport = pdfPageObj.getViewport({ scale: currentScale.value });
+          cw.value = viewport.width; 
+          ch.value = viewport.height;
+
+          nextTick(() => {
+            const canvas = document.getElementById('pdf-canvas');
+            const context = canvas.getContext('2d');
+            canvas.width = viewport.width; 
+            canvas.height = viewport.height;
+            
+            pdfPageObj.render({ canvasContext: context, viewport }).promise.then(() => {
+              if (isInitialLoad) {
+                initFabric(pdfId, viewport.width, viewport.height);
+              } else {
+                fCanvas.setWidth(viewport.width);
+                fCanvas.setHeight(viewport.height);
+                fCanvas.setZoom(currentScale.value);
+                fCanvas.renderAll();
+              }
+              loading.value = false;
+            });
+          });
+        };
+
+        function initFabric(pdfId, w, h) {
+          if (fCanvas) fCanvas.dispose();
+          fCanvas = new fabric.Canvas('drawing-canvas', { width: w, height: h });
+          
+          google.script.run.withSuccessHandler(jsonString => {
+            const data = JSON.parse(jsonString);
+            historyList.value = data.history || [];
+            currentIndex.value = data.currentIndex !== undefined ? data.currentIndex : historyList.value.length - 1;
+            
+            if (currentIndex.value >= 0 && historyList.value[currentIndex.value]) {
+              fCanvas.loadFromJSON(historyList.value[currentIndex.value].data, () => {
+                fCanvas.setZoom(currentScale.value);
+                fCanvas.renderAll();
+                setupFabricEvents();
+              });
+            } else {
+              fCanvas.setZoom(currentScale.value);
+              setupFabricEvents();
+            }
+            setTool('pen');
+          }).loadAnnotationFile(pdfId);
+        }
+
+        function setupFabricEvents() {
+          fCanvas.on('path:created', (opt) => {
+            if (tool.value === 'highlighter' && showTag.value) {
+              const bounds = opt.path.getBoundingRect();
+              addAuthorTag((bounds.left + bounds.width) / currentScale.value, bounds.top / currentScale.value);
+            }
+          });
+          fCanvas.on('mouse:down', (opt) => {
+            if (tool.value === 'text' && !opt.target) {
+              const pointer = fCanvas.getPointer(opt.e);
+              const text = new fabric.IText('', { left: pointer.x, top: pointer.y, fill: selectedColor.value, fontSize: 18, fontFamily: 'Arial' });
+              fCanvas.add(text);
+              fCanvas.setActiveObject(text);
+              text.enterEditing();
+              text.on('editing:exited', () => {
+                if (text.text.trim() === '') fCanvas.remove(text);
+                else if (showTag.value) {
+                  const bounds = text.getBoundingRect();
+                  addAuthorTag((bounds.left + bounds.width) / currentScale.value, bounds.top / currentScale.value);
+                }
+              });
+            } else if (tool.value === 'eraser' && opt.target) {
+              fCanvas.remove(opt.target);
+            }
+          });
+        }
+
+        function addAuthorTag(leftRaw, topRaw) {
+          const tag = new fabric.Text(userDetails.value.initials, { left: leftRaw + 2, top: topRaw - 5, fontSize: 10, fill: selectedColor.value, selectable: false, evented: false });
+          fCanvas.add(tag);
+          fCanvas.renderAll();
+        }
+
+        const updateToolOptions = () => setTool(tool.value);
+        
+        // Classic concatenation for compatibility
+        const hexToRgba = (hex, opacity) => {
+          const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+          if (result) {
+            return 'rgba(' + parseInt(result[1], 16) + ', ' + parseInt(result[2], 16) + ', ' + parseInt(result[3], 16) + ', ' + opacity + ')';
+          }
+          return 'rgba(255, 255, 0, ' + opacity + ')';
+        };
+
+        const setTool = (t) => {
+          tool.value = t;
+          if (!fCanvas) return;
+          fCanvas.isDrawingMode = (t === 'pen' || t === 'highlighter');
+          fCanvas.defaultCursor = t === 'text' ? 'text' : 'default';
+          if (t === 'pen' || t === 'highlighter') {
+            fCanvas.freeDrawingBrush = new fabric.PencilBrush(fCanvas);
+            fCanvas.freeDrawingBrush.color = t === 'pen' ? selectedColor.value : hexToRgba(selectedColor.value, 0.4);
+            fCanvas.freeDrawingBrush.width = (t === 'pen' ? 3 : 20);
+          }
+        };
+
+        const undo = () => {
+          const objects = fCanvas.getObjects();
+          if (objects.length > 0) fCanvas.remove(objects[objects.length - 1]);
+        };
+
+        const getCleanJson = () => {
+          const z = fCanvas.getZoom();
+          fCanvas.setZoom(1);
+          const data = fCanvas.toJSON();
+          fCanvas.setZoom(z);
+          return data;
+        };
+
+        const saveAnnotations = () => {
+          saving.value = true;
+          if (currentIndex.value < historyList.value.length - 1) {
+            historyList.value = historyList.value.slice(0, currentIndex.value + 1);
+          }
+          historyList.value.push({
+            date: new Date().toISOString(), author: userDetails.value.email, initials: userDetails.value.initials,
+            data: getCleanJson()
+          });
+          currentIndex.value = historyList.value.length - 1;
+
+          google.script.run.withSuccessHandler(() => {
+            saving.value = false;
+            toast.value = { show: true, message: t('savedSuccess'), url: null };
+          }).saveAnnotationFile(currentPdf.value.id, JSON.stringify({ history: historyList.value, currentIndex: currentIndex.value }));
+        };
+
+        const restoreVersion = (index) => {
+          currentIndex.value = index;
+          fCanvas.loadFromJSON(historyList.value[index].data, () => {
+            fCanvas.setZoom(currentScale.value);
+            fCanvas.renderAll();
+            historyDialog.value = false;
+            toast.value = { show: true, message: t('restored'), url: null };
+          });
+        };
+
+        const uint8ToBase64 = (u8Arr) => {
+          const CHUNK_SIZE = 0x8000; 
+          let index = 0;
+          let result = '';
+          while (index < u8Arr.length) {
+            let slice = u8Arr.subarray(index, Math.min(index + CHUNK_SIZE, u8Arr.length));
+            result += String.fromCharCode.apply(null, slice);
+            index += CHUNK_SIZE;
+          }
+          return btoa(result);
+        };
+
+        // Master export function handling inverse transformation matrices
+        const performExport = async (isOverwrite) => {
+          exporting.value = true;
+          if (!isOverwrite) toast.value = { show: true, message: t('exporting'), url: null };
+          
+          try {
+            google.script.run.withSuccessHandler(async (base64) => {
+              const originalBytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+              const pdfDoc = await PDFLib.PDFDocument.load(originalBytes);
+              const firstPage = pdfDoc.getPages()[0];
+
+              let origRotation = firstPage.getRotation().angle % 360;
+              if (origRotation < 0) origRotation += 360;
+
+              const visualViewport = pdfPageObj.getViewport({ scale: 1.0 });
+              const vw = visualViewport.width;
+              const vh = visualViewport.height;
+
+              const isLandscapeRotation = (origRotation === 90 || origRotation === 270);
+              const rw = isLandscapeRotation ? vh : vw;
+              const rh = isLandscapeRotation ? vw : vh;
+
+              const tempCanvasEl = document.createElement('canvas');
+              tempCanvasEl.width = vw;
+              tempCanvasEl.height = vh;
+              
+              const tempFabric = new fabric.StaticCanvas(tempCanvasEl, {
+                width: vw,
+                height: vh,
+                enableRetinaScaling: false 
+              });
+
+              tempFabric.loadFromJSON(getCleanJson(), async () => {
+                tempFabric.renderAll();
+                const dataUrl = tempFabric.toDataURL({ format: 'png', multiplier: 3 });
+                const pngImage = await pdfDoc.embedPng(dataUrl);
+
+                let dx = 0, dy = 0, dAngle = 0;
+
+                if (origRotation === 0) {
+                  dx = 0; dy = 0; dAngle = 0;
+                } else if (origRotation === 90) {
+                  dx = rw; dy = 0; dAngle = 90;
+                } else if (origRotation === 180) {
+                  dx = rw; dy = rh; dAngle = 180;
+                } else if (origRotation === 270) {
+                  dx = 0; dy = rh; dAngle = 270;
+                }
+
+                firstPage.drawImage(pngImage, {
+                  x: dx,
+                  y: dy,
+                  width: vw,
+                  height: vh,
+                  rotate: PDFLib.degrees(dAngle)
+                });
+                
+                const pdfBytes = await pdfDoc.save();
+                const outBase64 = uint8ToBase64(new Uint8Array(pdfBytes));
+                
+                const cleanName = currentPdf.value.name.toLowerCase().endsWith('.pdf') ? currentPdf.value.name.slice(0, -4) : currentPdf.value.name;
+                const newName = cleanName + '_commented.pdf';
+                
+                google.script.run.withSuccessHandler((response) => {
+                  exporting.value = false;
+                  
+                  if (response.status === 'EXISTS') {
+                    pendingExportData.value = { base64: outBase64, name: newName };
+                    overwriteDialog.value = true;
+                  } else if (response.status === 'OK') {
+                    toast.value = { show: true, message: t('exportSuccess'), url: response.url };
+                    overwriteDialog.value = false;
+                    pendingExportData.value = null;
+                  }
+                }).saveFlattenedPdf(currentPdf.value.id, outBase64, newName, isOverwrite);
+              });
+            }).getPdfBase64(currentPdf.value.id);
+          } catch (e) {
+            exporting.value = false;
+            toast.value = { show: true, message: 'Error: ' + e.message, url: null };
+          }
+        };
+
+        const exportPdf = () => performExport(false);
+
+        const confirmOverwrite = () => {
+          if (!pendingExportData.value) return;
+          exporting.value = true;
+          google.script.run.withSuccessHandler((response) => {
+            exporting.value = false;
+            if (response.status === 'OK') {
+              toast.value = { show: true, message: t('exportSuccess'), url: response.url };
+              overwriteDialog.value = false;
+              pendingExportData.value = null;
+            }
+          }).saveFlattenedPdf(currentPdf.value.id, pendingExportData.value.base64, pendingExportData.value.name, true);
+        };
+
+        const cancelExport = () => {
+          overwriteDialog.value = false;
+          pendingExportData.value = null;
+          exporting.value = false;
+        };
+
+        return { 
+          t, rootNodes, pdfList, loadFiles, refreshFolder, loadMore, openDriveFolder,
+          selectedFolderName, openPdf, closeEditor, formatDate, openLink, loading, 
+          editorOpen, currentPdf, currentFolder, tool, setTool, undo, cw, ch, saveAnnotations, 
+          saving, selectedColor, updateToolOptions, showTag, toast, historyList, currentIndex, 
+          historyDialog, restoreVersion, currentScale, changeZoom, exportPdf, exporting, 
+          overwriteDialog, confirmOverwrite, cancelExport 
+        };
+      }
+    }).use(vuetify).mount('#app');
+  </script>
+</body>
+</html>
